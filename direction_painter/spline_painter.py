@@ -28,9 +28,12 @@ class SplinePainter:
         self.scene  = scene
         self.params = SplineParams()
 
-        self._ctrl_uvs: List[np.ndarray] = []
-        self._preview_uvs:  Optional[np.ndarray] = None   # (N, 2) sampled curve
-        self._preview_tans: Optional[np.ndarray] = None   # (N, 2) unit tangents
+        self._ctrl_uvs:   List[np.ndarray] = []
+        self._ctrl_world: List[np.ndarray] = []   # exact 3-D hit position
+
+        self._preview_uvs:   Optional[np.ndarray] = None   # (N, 2)
+        self._preview_tans:  Optional[np.ndarray] = None   # (N, 2) unit tangents
+        self._preview_world: Optional[np.ndarray] = None   # (N, 3) for renderer
 
     # ──────────────────────────────────────────────────────────────────────
 
@@ -43,17 +46,24 @@ class SplinePainter:
         return self._ctrl_uvs
 
     @property
-    def preview_uvs(self) -> Optional[np.ndarray]:
-        return self._preview_uvs
+    def ctrl_world(self) -> List[np.ndarray]:
+        return self._ctrl_world
 
-    def add_point(self, uv: np.ndarray) -> None:
+    @property
+    def preview_world(self) -> Optional[np.ndarray]:
+        return self._preview_world
+
+    def add_point(self, uv: np.ndarray, world_pos: np.ndarray) -> None:
         self._ctrl_uvs.append(uv.copy())
+        self._ctrl_world.append(world_pos.copy())
         self._rebuild_preview()
 
     def cancel(self) -> None:
-        self._ctrl_uvs     = []
-        self._preview_uvs  = None
-        self._preview_tans = None
+        self._ctrl_uvs    = []
+        self._ctrl_world  = []
+        self._preview_uvs   = None
+        self._preview_tans  = None
+        self._preview_world = None
 
     def commit(self, renderer) -> None:
         """Rasterize the current spline into the active layer."""
@@ -118,51 +128,58 @@ class SplinePainter:
     # ──────────────────────────────────────────────────────────────────────
 
     def _rebuild_preview(self) -> None:
-        pts = self._ctrl_uvs
-        n   = len(pts)
+        uv_pts    = self._ctrl_uvs
+        world_pts = self._ctrl_world
+        n         = len(uv_pts)
 
         if n == 0:
-            self._preview_uvs  = None
-            self._preview_tans = None
+            self._preview_uvs   = None
+            self._preview_tans  = None
+            self._preview_world = None
             return
 
         if n == 1:
-            self._preview_uvs  = np.array([pts[0]], dtype=np.float32)
-            self._preview_tans = np.array([[1.0, 0.0]], dtype=np.float32)
+            self._preview_uvs   = np.array([uv_pts[0]],    dtype=np.float32)
+            self._preview_tans  = np.array([[1.0, 0.0]],   dtype=np.float32)
+            self._preview_world = np.array([world_pts[0]], dtype=np.float32)
             return
 
         steps_per_seg = max(30, 200 // max(n - 1, 1))
-        sampled:  list = []
-        tangents: list = []
+        sampled_uv:    list = []
+        sampled_world: list = []
+        tangents:      list = []
 
         for seg in range(n - 1):
-            p0 = pts[max(0, seg - 1)]
-            p1 = pts[seg]
-            p2 = pts[seg + 1]
-            p3 = pts[min(n - 1, seg + 2)]
+            i0 = max(0, seg - 1)
+            i1 = seg
+            i2 = seg + 1
+            i3 = min(n - 1, seg + 2)
 
             for j in range(steps_per_seg):
                 t   = j / steps_per_seg
-                pos = _catmull_rom(p0, p1, p2, p3, t)
-                tan = _catmull_rom_tan(p0, p1, p2, p3, t)
+                uv  = _catmull_rom(uv_pts[i0],    uv_pts[i1],    uv_pts[i2],    uv_pts[i3],    t)
+                wp  = _catmull_rom(world_pts[i0], world_pts[i1], world_pts[i2], world_pts[i3], t)
+                tan = _catmull_rom_tan(uv_pts[i0], uv_pts[i1], uv_pts[i2], uv_pts[i3], t)
                 mag = np.linalg.norm(tan)
                 tan = tan / mag if mag > 1e-8 else np.array([1.0, 0.0])
-                sampled.append(pos)
+                sampled_uv.append(uv)
+                sampled_world.append(wp)
                 tangents.append(tan)
 
         # Final endpoint
-        p0 = pts[max(0, n - 3)]
-        p1 = pts[max(0, n - 2)]
-        p2 = pts[n - 1]
-        pos = _catmull_rom(p0, p1, p2, p2, 1.0)
-        tan = _catmull_rom_tan(p0, p1, p2, p2, 1.0)
+        i0, i1, i2 = max(0, n - 3), max(0, n - 2), n - 1
+        uv  = _catmull_rom(uv_pts[i0],    uv_pts[i1],    uv_pts[i2],    uv_pts[i2],    1.0)
+        wp  = _catmull_rom(world_pts[i0], world_pts[i1], world_pts[i2], world_pts[i2], 1.0)
+        tan = _catmull_rom_tan(uv_pts[i0], uv_pts[i1], uv_pts[i2], uv_pts[i2], 1.0)
         mag = np.linalg.norm(tan)
         tan = tan / mag if mag > 1e-8 else np.array([1.0, 0.0])
-        sampled.append(pos)
+        sampled_uv.append(uv)
+        sampled_world.append(wp)
         tangents.append(tan)
 
-        self._preview_uvs  = np.array(sampled,  dtype=np.float32)
-        self._preview_tans = np.array(tangents, dtype=np.float32)
+        self._preview_uvs   = np.array(sampled_uv,    dtype=np.float32)
+        self._preview_world = np.array(sampled_world, dtype=np.float32)
+        self._preview_tans  = np.array(tangents,      dtype=np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -338,11 +338,14 @@ class App:
                 and self.scene.layers
                 and self.renderer is not None
                 and self.spline_painter is not None
+                and self.painter is not None
             ):
                 tri, u, v = self.renderer.read_pick_pixel(lx, ly)
                 if tri >= 0:
-                    uv = self.painter._interpolate_uv(tri, u, v)
-                    self.spline_painter.add_point(uv)
+                    uv        = self.painter._interpolate_uv(tri, u, v)
+                    world_pos = self.painter._interpolate_attr(
+                        tri, u, v, self.scene.mesh.vertices)
+                    self.spline_painter.add_point(uv, world_pos)
                     self._refresh_spline_preview()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -395,8 +398,8 @@ class App:
         if self.spline_painter is None or self.renderer is None:
             return
         self.renderer.update_spline_preview(
-            self.spline_painter.preview_uvs,
-            self.spline_painter.ctrl_uvs,
+            self.spline_painter.preview_world,
+            self.spline_painter.ctrl_world,
         )
 
     def _open_file_dialog(self) -> None:

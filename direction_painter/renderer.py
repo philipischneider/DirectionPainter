@@ -414,48 +414,34 @@ class Renderer:
 
     def update_spline_preview(
         self,
-        curve_uvs: np.ndarray | None,   # (N, 2) sampled spline
-        ctrl_uvs:  list | None,         # list of (2,) control-point UVs
+        curve_world: np.ndarray | None,   # (N, 3) sampled curve in world space
+        ctrl_world:  list | None,         # list of (3,) exact world positions
     ) -> None:
-        """Convert UV positions to world coords and upload to preview VBOs."""
-        if self._uv_tree is None:
-            self._spline_curve_count = 0
-            self._spline_ctrl_count  = 0
-            return
-
-        # ── Curve ──────────────────────────────────────────────────────
-        if curve_uvs is not None and len(curve_uvs) > 0:
-            _, idxs = self._uv_tree.query(curve_uvs)
-            pts = self._face_positions[idxs].astype(np.float32)
+        """Upload world-space positions to the spline preview VBOs."""
+        # ── Curve (LINE_STRIP) ──────────────────────────────────────────
+        if curve_world is not None and len(curve_world) > 0:
+            pts = np.asarray(curve_world, dtype=np.float32)
             n   = min(len(pts), 4096)
             self._spline_curve_vbo.write(pts[:n].tobytes())
             self._spline_curve_count = n
         else:
             self._spline_curve_count = 0
 
-        # ── Control point crosses ───────────────────────────────────────
-        if ctrl_uvs is not None and len(ctrl_uvs) > 0:
+        # ── Control point crosses (GL_LINES) ────────────────────────────
+        # Use fixed world-space axes for the cross arms — the position is what
+        # matters; orientation is purely cosmetic.
+        if ctrl_world is not None and len(ctrl_world) > 0:
+            half = 0.016
+            ax   = np.array([half, 0.0,  0.0], dtype=np.float32)
+            ay   = np.array([0.0,  half, 0.0], dtype=np.float32)
             crosses = []
-            half_t  = 0.014   # world-space half-length of cross arm
-            half_b  = 0.014
-            for uv in ctrl_uvs:
-                dist, fi = self._uv_tree.query(uv)
-                if dist > 0.1:
-                    continue
-                pos   = self._face_positions[fi]
-                tan   = self._face_tangents[fi]
-                btan  = self._face_bitangents[fi]
-                crosses.append(pos - tan  * half_t)
-                crosses.append(pos + tan  * half_t)
-                crosses.append(pos - btan * half_b)
-                crosses.append(pos + btan * half_b)
+            for pos in ctrl_world:
+                p = np.asarray(pos, dtype=np.float32)
+                crosses.extend([p - ax, p + ax, p - ay, p + ay])
             m = min(len(crosses), 128 * 4)
-            if crosses:
-                data = np.array(crosses[:m], dtype=np.float32)
-                self._spline_ctrl_vbo.write(data.tobytes())
-                self._spline_ctrl_count = m
-            else:
-                self._spline_ctrl_count = 0
+            data = np.array(crosses[:m], dtype=np.float32)
+            self._spline_ctrl_vbo.write(data.tobytes())
+            self._spline_ctrl_count = m
         else:
             self._spline_ctrl_count = 0
 
