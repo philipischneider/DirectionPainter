@@ -1,0 +1,7 @@
+trimesh[easy]>=4.0
+moderngl>=5.10
+imgui-bundle>=1.5
+numpy>=1.26
+scipy>=1.12
+Pillow>=10.0
+pypng>=0.20220715
