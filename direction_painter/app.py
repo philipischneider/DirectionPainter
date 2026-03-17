@@ -19,6 +19,7 @@ from .camera import OrbitCamera
 from .mesh_loader import load_gltf
 from .renderer import Renderer
 from .painter import Painter
+from .spline_painter import SplinePainter
 from .undo_stack import UndoStack
 from .fill_island import fill_island
 from .export import export_layer
@@ -32,11 +33,13 @@ class App:
         self.scene    = Scene()
         self.camera   = OrbitCamera()
         self.undo     = UndoStack()
-        self.renderer: Optional[Renderer] = None
-        self.painter:  Optional[Painter]  = None
+        self.renderer:       Optional[Renderer]      = None
+        self.painter:        Optional[Painter]        = None
+        self.spline_painter: Optional[SplinePainter] = None
 
-        self._is_painting     = False
-        self._is_navigating   = False
+        self._tool          = "Brush"   # "Brush" | "Spline"
+        self._is_painting   = False
+        self._is_navigating = False
 
         self._viewport_pos  = (0, 0)   # screen position of the viewport image
         self._viewport_size = (800, 600)
@@ -71,8 +74,9 @@ class App:
 
     def _post_init(self) -> None:
         """Called once after the OpenGL context is created."""
-        self.renderer = Renderer()
-        self.painter  = Painter(self.scene, self.undo)
+        self.renderer       = Renderer()
+        self.painter        = Painter(self.scene, self.undo)
+        self.spline_painter = SplinePainter(self.scene)
 
     def _before_exit(self) -> None:
         pass   # moderngl objects will be released by GC
@@ -171,22 +175,26 @@ class App:
             if ok:
                 self.scene.active_layer_idx = i
 
-        # Brush
-        imgui.separator_text("Brush")
-        modes       = ["Stroke", "Radial", "Circular", "Comb"]
-        if self.painter:
-            current     = modes.index(self.painter.brush.mode)
-            changed, current = imgui.combo("Mode", current, modes)
-            if changed:
-                self.painter.brush.mode = modes[current]
-            _, self.painter.brush.radius   = imgui.slider_float(
-                "Radius",   self.painter.brush.radius,   0.005, 0.3)
-            _, self.painter.brush.strength = imgui.slider_float(
-                "Strength", self.painter.brush.strength, 0.01,  1.0)
+        # Tool selector
+        imgui.separator_text("Tool")
+        for tool in ("Brush", "Spline"):
+            active = self._tool == tool
+            if active:
+                imgui.push_style_color(imgui.Col_.button,
+                                       (0.20, 0.55, 0.85, 1.0))
+            if imgui.button(f"{tool}##tool"):
+                if self._tool != tool:
+                    self._switch_tool(tool)
+            if active:
+                imgui.pop_style_color()
+            imgui.same_line()
+        imgui.new_line()
 
-            if self.painter.brush.mode == "Radial":
-                _, self.painter.brush.inward = imgui.checkbox(
-                    "Inward", self.painter.brush.inward)
+        # Tool-specific settings
+        if self._tool == "Brush":
+            self._draw_brush_panel()
+        else:
+            self._draw_spline_panel()
 
         # Hatching preview
         imgui.separator_text("Hatching")
@@ -218,6 +226,45 @@ class App:
         if self._status:
             imgui.separator()
             imgui.text_wrapped(self._status)
+
+    def _draw_brush_panel(self) -> None:
+        imgui.separator_text("Brush")
+        modes = ["Stroke", "Radial", "Circular", "Comb"]
+        if self.painter:
+            current = modes.index(self.painter.brush.mode)
+            changed, current = imgui.combo("Mode", current, modes)
+            if changed:
+                self.painter.brush.mode = modes[current]
+            _, self.painter.brush.radius   = imgui.slider_float(
+                "Radius",   self.painter.brush.radius,   0.005, 0.3)
+            _, self.painter.brush.strength = imgui.slider_float(
+                "Strength", self.painter.brush.strength, 0.01,  1.0)
+            if self.painter.brush.mode == "Radial":
+                _, self.painter.brush.inward = imgui.checkbox(
+                    "Inward", self.painter.brush.inward)
+
+    def _draw_spline_panel(self) -> None:
+        imgui.separator_text("Spline")
+        sp = self.spline_painter
+        if sp is None:
+            return
+
+        _, sp.params.radius   = imgui.slider_float(
+            "Radius##sp",   sp.params.radius,   0.005, 0.3)
+        _, sp.params.strength = imgui.slider_float(
+            "Strength##sp", sp.params.strength, 0.01,  1.0)
+
+        n = len(sp.ctrl_uvs)
+        if n == 0:
+            imgui.text_disabled("Click on the mesh to place points.")
+        else:
+            imgui.text(f"{n} point{'s' if n != 1 else ''} placed.")
+            imgui.text_disabled("Enter — commit   Esc — cancel")
+            imgui.spacing()
+            if imgui.button("Commit##sp", (-1.0, 0.0)):
+                self._spline_commit()
+            if imgui.button("Cancel##sp", (-1.0, 0.0)):
+                self._spline_cancel()
 
     # ──────────────────────────────────────────────────────────────────────
     # Mouse handling
@@ -256,31 +303,47 @@ class App:
         if mmb_released:
             self._is_navigating = False
 
-        # Paint — LMB (always active in viewport, no mode toggle needed)
-        if (
-            in_vp and lmb_clicked
-            and self.scene.mesh is not None
-            and self.scene.layers
-            and self.renderer is not None
-            and self.painter is not None
-        ):
-            tri, u, v = self.renderer.read_pick_pixel(lx, ly)
-            if tri >= 0:
-                self._is_painting = True
-                self.painter.begin_stroke(tri, u, v, self.camera,
-                                          (lx, ly), (vw, vh))
-
-        if lmb_down and self._is_painting:
-            if self.renderer is not None and self.painter is not None:
+        # ── Brush tool ─────────────────────────────────────────────────
+        if self._tool == "Brush":
+            if (
+                in_vp and lmb_clicked
+                and self.scene.mesh is not None
+                and self.scene.layers
+                and self.renderer is not None
+                and self.painter is not None
+            ):
                 tri, u, v = self.renderer.read_pick_pixel(lx, ly)
                 if tri >= 0:
-                    self.painter.paint_point(tri, u, v, self.camera,
-                                             (lx, ly), (vw, vh))
+                    self._is_painting = True
+                    self.painter.begin_stroke(tri, u, v, self.camera,
+                                              (lx, ly), (vw, vh))
 
-        if lmb_released and self._is_painting:
-            if self.painter is not None and self.renderer is not None:
-                self.painter.end_stroke(self.renderer)
-            self._is_painting = False
+            if lmb_down and self._is_painting:
+                if self.renderer is not None and self.painter is not None:
+                    tri, u, v = self.renderer.read_pick_pixel(lx, ly)
+                    if tri >= 0:
+                        self.painter.paint_point(tri, u, v, self.camera,
+                                                 (lx, ly), (vw, vh))
+
+            if lmb_released and self._is_painting:
+                if self.painter is not None and self.renderer is not None:
+                    self.painter.end_stroke(self.renderer)
+                self._is_painting = False
+
+        # ── Spline tool ────────────────────────────────────────────────
+        elif self._tool == "Spline":
+            if (
+                in_vp and lmb_clicked
+                and self.scene.mesh is not None
+                and self.scene.layers
+                and self.renderer is not None
+                and self.spline_painter is not None
+            ):
+                tri, u, v = self.renderer.read_pick_pixel(lx, ly)
+                if tri >= 0:
+                    uv = self.painter._interpolate_uv(tri, u, v)
+                    self.spline_painter.add_point(uv)
+                    self._refresh_spline_preview()
 
     # ──────────────────────────────────────────────────────────────────────
     # Keyboard handling
@@ -296,9 +359,45 @@ class App:
         if ctrl and imgui.is_key_pressed(imgui.Key.y):
             self._do_redo()
 
+        if self._tool == "Spline":
+            if imgui.is_key_pressed(imgui.Key.enter):
+                self._spline_commit()
+            if imgui.is_key_pressed(imgui.Key.escape):
+                self._spline_cancel()
+
     # ──────────────────────────────────────────────────────────────────────
     # Actions
     # ──────────────────────────────────────────────────────────────────────
+
+    def _switch_tool(self, tool: str) -> None:
+        if self._tool == "Spline" and self.spline_painter is not None:
+            self.spline_painter.cancel()
+            if self.renderer is not None:
+                self.renderer.clear_spline_preview()
+        self._tool = tool
+
+    def _spline_commit(self) -> None:
+        if self.spline_painter is None or self.renderer is None:
+            return
+        if not self.spline_painter.has_points:
+            return
+        self.spline_painter.commit(self.renderer)
+        self.renderer.clear_spline_preview()
+        self._status = "Spline committed."
+
+    def _spline_cancel(self) -> None:
+        if self.spline_painter is not None:
+            self.spline_painter.cancel()
+        if self.renderer is not None:
+            self.renderer.clear_spline_preview()
+
+    def _refresh_spline_preview(self) -> None:
+        if self.spline_painter is None or self.renderer is None:
+            return
+        self.renderer.update_spline_preview(
+            self.spline_painter.preview_uvs,
+            self.spline_painter.ctrl_uvs,
+        )
 
     def _open_file_dialog(self) -> None:
         try:
@@ -360,7 +459,8 @@ class App:
         self.scene.active_layer_idx = 0
 
         self.undo.clear()
-        self.painter  = Painter(self.scene, self.undo)
+        self.painter        = Painter(self.scene, self.undo)
+        self.spline_painter = SplinePainter(self.scene)
 
         if self.renderer is not None:
             self.renderer.upload_mesh(mesh)

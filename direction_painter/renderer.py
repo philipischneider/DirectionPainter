@@ -235,6 +235,20 @@ class Renderer:
         self._face_tangents:  np.ndarray | None = None
         self._face_bitangents: np.ndarray | None = None
 
+        # Spline preview — curve (LINE_STRIP) and control-point crosses (LINES)
+        _MAX_SPLINE = 4096
+        _MAX_CTRL   = 128
+        self._spline_curve_vbo = self.ctx.buffer(reserve=_MAX_SPLINE * 3 * 4)
+        self._spline_curve_vao = self.ctx.vertex_array(
+            self._tick_prog, [(self._spline_curve_vbo, "3f", "in_position")]
+        )
+        self._spline_ctrl_vbo  = self.ctx.buffer(reserve=_MAX_CTRL * 4 * 3 * 4)
+        self._spline_ctrl_vao  = self.ctx.vertex_array(
+            self._tick_prog, [(self._spline_ctrl_vbo, "3f", "in_position")]
+        )
+        self._spline_curve_count = 0
+        self._spline_ctrl_count  = 0
+
     # ──────────────────────────────────────────────────────────────────────
     # FBO management
     # ──────────────────────────────────────────────────────────────────────
@@ -395,6 +409,61 @@ class Renderer:
             self._tick_vbo.write(data)
 
     # ──────────────────────────────────────────────────────────────────────
+    # Spline preview
+    # ──────────────────────────────────────────────────────────────────────
+
+    def update_spline_preview(
+        self,
+        curve_uvs: np.ndarray | None,   # (N, 2) sampled spline
+        ctrl_uvs:  list | None,         # list of (2,) control-point UVs
+    ) -> None:
+        """Convert UV positions to world coords and upload to preview VBOs."""
+        if self._uv_tree is None:
+            self._spline_curve_count = 0
+            self._spline_ctrl_count  = 0
+            return
+
+        # ── Curve ──────────────────────────────────────────────────────
+        if curve_uvs is not None and len(curve_uvs) > 0:
+            _, idxs = self._uv_tree.query(curve_uvs)
+            pts = self._face_positions[idxs].astype(np.float32)
+            n   = min(len(pts), 4096)
+            self._spline_curve_vbo.write(pts[:n].tobytes())
+            self._spline_curve_count = n
+        else:
+            self._spline_curve_count = 0
+
+        # ── Control point crosses ───────────────────────────────────────
+        if ctrl_uvs is not None and len(ctrl_uvs) > 0:
+            crosses = []
+            half_t  = 0.014   # world-space half-length of cross arm
+            half_b  = 0.014
+            for uv in ctrl_uvs:
+                dist, fi = self._uv_tree.query(uv)
+                if dist > 0.1:
+                    continue
+                pos   = self._face_positions[fi]
+                tan   = self._face_tangents[fi]
+                btan  = self._face_bitangents[fi]
+                crosses.append(pos - tan  * half_t)
+                crosses.append(pos + tan  * half_t)
+                crosses.append(pos - btan * half_b)
+                crosses.append(pos + btan * half_b)
+            m = min(len(crosses), 128 * 4)
+            if crosses:
+                data = np.array(crosses[:m], dtype=np.float32)
+                self._spline_ctrl_vbo.write(data.tobytes())
+                self._spline_ctrl_count = m
+            else:
+                self._spline_ctrl_count = 0
+        else:
+            self._spline_ctrl_count = 0
+
+    def clear_spline_preview(self) -> None:
+        self._spline_curve_count = 0
+        self._spline_ctrl_count  = 0
+
+    # ──────────────────────────────────────────────────────────────────────
     # Render passes
     # ──────────────────────────────────────────────────────────────────────
 
@@ -470,6 +539,18 @@ class Renderer:
             self._tick_prog["u_mvp"].write(_mat4_bytes(mvp))
             self._tick_prog["u_color"].value = (1.0, 0.85, 0.2, 1.0)
             self._tick_vao.render(moderngl.LINES, vertices=self._tick_count)
+
+        # Spline preview overlay
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self._tick_prog["u_mvp"].write(_mat4_bytes(mvp))
+        if self._spline_curve_count > 0:
+            self._tick_prog["u_color"].value = (0.3, 0.9, 1.0, 1.0)   # cyan curve
+            self._spline_curve_vao.render(moderngl.LINE_STRIP,
+                                          vertices=self._spline_curve_count)
+        if self._spline_ctrl_count > 0:
+            self._tick_prog["u_color"].value = (1.0, 1.0, 1.0, 1.0)   # white crosses
+            self._spline_ctrl_vao.render(moderngl.LINES,
+                                         vertices=self._spline_ctrl_count)
 
         # Restore default framebuffer so Dear ImGui can render
         self.ctx.screen.use()
