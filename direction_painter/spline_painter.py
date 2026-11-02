@@ -2,9 +2,12 @@
 spline_painter.py — Catmull-Rom spline-based flow map painting.
 
 The user places control points on the mesh surface (UV space).
-On commit the spline is sampled densely and its tangent direction is
-painted into the flow map texture with a configurable radius of influence
-— same blending used by Painter (doubled-angle, smooth falloff).
+On commit the spline is sampled densely.  At each sample the tangent
+direction is used as the flow map value (standard 360° encoding:
+R=cos θ, G=sin θ).  The painted area extends perpendicularly to the
+spline on both sides up to `radius`; the B channel stores a linear
+falloff (1 at the spline, 0 at the edge) so downstream tools can use
+it as an influence mask.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -89,7 +92,10 @@ class SplinePainter:
         for i in range(len(pts)):
             uv    = pts[i]
             tan   = tans[i]
-            angle = float(np.arctan2(tan[1], tan[0]))
+            angle = float(np.arctan2(tan[1], tan[0]))  # full 360° angle
+
+            # Perpendicular direction (90° CCW from tangent), in UV space.
+            perp = np.array([-tan[1], tan[0]], dtype=np.float64)
 
             cx = int(uv[0] * W)
             cy = int(uv[1] * H)
@@ -100,18 +106,30 @@ class SplinePainter:
             y0 = max(0, cy - ry);  y1 = min(H, cy + ry + 1)
 
             ty_idx, tx_idx = np.mgrid[y0:y1, x0:x1]
-            du   = (tx_idx - cx) / (rx + 1e-6)
-            dv   = (ty_idx - cy) / (ry + 1e-6)
-            dist = np.sqrt(du * du + dv * dv)
-            weight = strength * (1.0 - dist) ** 2 * (dist <= 1.0)
 
-            sub         = layer.texture[y0:y1, x0:x1, :]
-            existing_a2 = np.arctan2(sub[..., 1], sub[..., 0])
-            new_a2      = np.full_like(existing_a2, 2.0 * angle)
-            diff        = (new_a2 - existing_a2 + np.pi) % (2 * np.pi) - np.pi
-            blended_a2  = existing_a2 + diff * weight
-            layer.texture[y0:y1, x0:x1, 0] = np.cos(blended_a2)
-            layer.texture[y0:y1, x0:x1, 1] = np.sin(blended_a2)
+            # Offset in UV space from the sample point centre.
+            du_uv = (tx_idx.astype(np.float64) + 0.5) / W - uv[0]
+            dv_uv = (ty_idx.astype(np.float64) + 0.5) / H - uv[1]
+
+            # Perpendicular distance (projection onto perp), normalised by radius.
+            perp_dist = np.abs(du_uv * perp[0] + dv_uv * perp[1]) / (radius + 1e-9)
+
+            mask   = perp_dist <= 1.0
+            weight = strength * mask.astype(np.float64)
+
+            # ── R and G: direction extends perpendicular to the spline ──
+            sub            = layer.texture[y0:y1, x0:x1, :]
+            existing_angle = np.arctan2(sub[..., 1].astype(np.float64),
+                                        sub[..., 0].astype(np.float64))
+            new_angle      = np.full_like(existing_angle, angle)
+            diff           = (new_angle - existing_angle + np.pi) % (2 * np.pi) - np.pi
+            blended_angle  = existing_angle + diff * weight
+            layer.texture[y0:y1, x0:x1, 0] = np.cos(blended_angle)
+            layer.texture[y0:y1, x0:x1, 1] = np.sin(blended_angle)
+
+            # ── B: linear falloff from 1 (at spline centre) to 0 (at edge) ──
+            b_falloff = np.maximum(0.0, 1.0 - perp_dist) * mask
+            layer.texture[y0:y1, x0:x1, 2] = np.maximum(sub[..., 2], b_falloff)
 
             dirty = _union_rect(dirty, (x0, y0, x1 - x0, y1 - y0))
 

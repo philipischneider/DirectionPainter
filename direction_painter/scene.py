@@ -11,8 +11,11 @@ class Mesh:
     tangents:   np.ndarray   # (N, 4) float32  — w is handedness sign
     uvs:        np.ndarray   # (N, 2) float32
     indices:    np.ndarray   # (F, 3) uint32
-    bitangents: np.ndarray   # (N, 3) float32  — precomputed
-    uv_aspect:  np.ndarray   # (N,)   float32  — |∂pos/∂u| / |∂pos/∂v| per vertex
+    bitangents:  np.ndarray   # (N, 3) float32  — precomputed
+    uv_aspect:   np.ndarray   # (N,)   float32  — |∂pos/∂u| / |∂pos/∂v| per vertex
+    uv_tan_len:  np.ndarray   # (N,)   float32  — |∂pos/∂u| in world units per vertex
+    face_uv_aspect:  np.ndarray  = None   # (F,) float32 — per-face (flat, not averaged)
+    face_uv_tan_len: np.ndarray  = None   # (F,) float32 — per-face
 
     # Cached UV-space lookup data, populated by Renderer on mesh upload
     face_uv_centroids:  Optional[np.ndarray] = None  # (F, 2) float32
@@ -37,16 +40,17 @@ class DirectionLayer:
     name:    str
     width:   int
     height:  int
-    texture: np.ndarray   # (H, W, 2) float32  R=cos(θ), G=sin(θ)
+    texture: np.ndarray   # (H, W, 3) float32  R=cos(θ), G=sin(θ), B=intensity [0,1]
     # moderngl.Texture set by Renderer; None until mesh is loaded
     gpu_texture: object = None
     dirty: bool = False
 
     @staticmethod
     def create(name: str, width: int, height: int) -> DirectionLayer:
-        """Create a layer pre-filled with the neutral direction (cos0, sin0) = (1, 0)."""
-        tex = np.zeros((height, width, 2), dtype=np.float32)
+        """Create a layer pre-filled with the neutral direction (cos0, sin0) = (1, 0) and B=0."""
+        tex = np.zeros((height, width, 3), dtype=np.float32)
         tex[..., 0] = 1.0   # cos(0) = 1 → along +U axis
+        # B channel (intensity) starts at 0 — unpainted
         return DirectionLayer(name=name, width=width, height=height, texture=tex)
 
 
@@ -55,6 +59,8 @@ class Scene:
     mesh: Optional[Mesh] = None
     layers: List[DirectionLayer] = field(default_factory=list)
     active_layer_idx: int = 0
+    poly_theta: Optional[np.ndarray] = None   # (F,) float32 — per-face hatching angle
+    poly_scale: Optional[np.ndarray] = None   # (F,) float32 — per-face density scale
 
     @property
     def active_layer(self) -> Optional[DirectionLayer]:

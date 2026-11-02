@@ -46,8 +46,12 @@ class App:
 
         self._tex_resolution = 1024
 
-        self._show_hatching = False
-        self._hatch_freq    = 30.0
+        self._show_hatching  = False
+        self._hatch_freq     = 30.0
+        self._flowmap_mode   = 0   # 0 = hue wheel, 1 = raw channels
+
+        self._selected_face  = -1   # face index highlighted in Poly mode
+        self._poly_drag_face = -1   # face being rotated by current drag
 
         # Status messages shown at the bottom of the side panel
         self._status = ""
@@ -113,6 +117,9 @@ class App:
                     self.camera, (vw, vh), self.scene.active_layer,
                     show_hatching=self._show_hatching,
                     hatch_freq=self._hatch_freq,
+                    flowmap_mode=self._flowmap_mode,
+                    use_poly_theta=(self._tool == "Poly"),
+                    selected_face=self._selected_face if self._tool == "Poly" else -1,
                 )
 
             if self.renderer.view_tex is not None:
@@ -177,7 +184,7 @@ class App:
 
         # Tool selector
         imgui.separator_text("Tool")
-        for tool in ("Brush", "Spline"):
+        for tool in ("Brush", "Spline", "Poly"):
             active = self._tool == tool
             if active:
                 imgui.push_style_color(imgui.Col_.button,
@@ -193,8 +200,24 @@ class App:
         # Tool-specific settings
         if self._tool == "Brush":
             self._draw_brush_panel()
-        else:
+        elif self._tool == "Spline":
             self._draw_spline_panel()
+        else:
+            self._draw_poly_panel()
+
+        # Flow map visualization mode (only relevant when hatching is off)
+        imgui.separator_text("Flow Map View")
+        _mode_labels = ("Hue", "Raw Channels")
+        for mi, mlabel in enumerate(_mode_labels):
+            active = self._flowmap_mode == mi
+            if active:
+                imgui.push_style_color(imgui.Col_.button, (0.20, 0.55, 0.85, 1.0))
+            if imgui.button(f"{mlabel}##fmmode"):
+                self._flowmap_mode = mi
+            if active:
+                imgui.pop_style_color()
+            imgui.same_line()
+        imgui.new_line()
 
         # Hatching preview
         imgui.separator_text("Hatching")
@@ -266,6 +289,61 @@ class App:
             if imgui.button("Cancel##sp", (-1.0, 0.0)):
                 self._spline_cancel()
 
+    def _draw_poly_panel(self) -> None:
+        imgui.separator_text("Poly Hatch")
+        if self.scene.mesh is None:
+            imgui.text_disabled("Load a mesh first.")
+            return
+
+        # ── Selected face controls ─────────────────────────────────────
+        if self._selected_face < 0:
+            imgui.text_disabled("Click a polygon to select it.")
+            imgui.text_disabled("Drag left/right: rotate direction.")
+        else:
+            imgui.text(f"Face: {self._selected_face}")
+            pt = self.scene.poly_theta
+            ps = self.scene.poly_scale
+            fi = self._selected_face
+
+            if pt is not None:
+                deg = float(np.degrees(pt[fi])) % 360.0
+                changed, new_deg = imgui.slider_float(
+                    "Direction\xb0##poly_theta", deg, 0.0, 360.0)
+                if changed:
+                    self._poly_set(fi, float(np.radians(new_deg)))
+
+            if ps is not None:
+                changed, new_s = imgui.slider_float(
+                    "Scale##poly_scale", float(ps[fi]), 0.1, 5.0)
+                if changed:
+                    self._poly_scale_set(fi, new_s)
+
+            imgui.spacing()
+            if imgui.button("Reset selected##poly", (-1.0, 0.0)):
+                self._poly_set(fi, 0.0)
+                self._poly_scale_set(fi, 1.0)
+
+        # ── Batch ops ──────────────────────────────────────────────────
+        imgui.spacing()
+        imgui.separator_text("Batch")
+        if imgui.button("Reset all##poly_all", (-1.0, 0.0)):
+            if self.scene.poly_theta is not None:
+                self.scene.poly_theta[:] = 0.0
+                self.scene.poly_scale[:] = 1.0
+                if self.renderer is not None:
+                    self.renderer.update_poly_theta(self.scene.poly_theta)
+                    self.renderer.update_poly_scale(self.scene.poly_scale)
+        if imgui.button("Bake to flow map##poly_bake", (-1.0, 0.0)):
+            self._bake_poly_to_layer()
+
+        # ── Persistence ────────────────────────────────────────────────
+        imgui.spacing()
+        imgui.separator_text("File")
+        if imgui.button("Save poly data##poly_save", (-1.0, 0.0)):
+            self._save_poly()
+        if imgui.button("Load poly data##poly_load", (-1.0, 0.0)):
+            self._load_poly()
+
     # ──────────────────────────────────────────────────────────────────────
     # Mouse handling
     # ──────────────────────────────────────────────────────────────────────
@@ -330,6 +408,27 @@ class App:
                     self.painter.end_stroke(self.renderer)
                 self._is_painting = False
 
+        # ── Poly tool ──────────────────────────────────────────────────
+        elif self._tool == "Poly":
+            if (
+                in_vp and lmb_clicked
+                and self.scene.mesh is not None
+                and self.renderer is not None
+            ):
+                tri, u, v = self.renderer.read_pick_pixel(lx, ly)
+                if tri >= 0:
+                    self._selected_face  = tri
+                    self._poly_drag_face = tri
+
+            if lmb_down and self._poly_drag_face >= 0 and dx != 0.0:
+                self._poly_set(self._poly_drag_face,
+                               (self.scene.poly_theta[self._poly_drag_face]
+                                + dx * 0.01)
+                               if self.scene.poly_theta is not None else 0.0)
+
+            if lmb_released:
+                self._poly_drag_face = -1
+
         # ── Spline tool ────────────────────────────────────────────────
         elif self._tool == "Spline":
             if (
@@ -372,11 +471,134 @@ class App:
     # Actions
     # ──────────────────────────────────────────────────────────────────────
 
+    def _poly_set(self, face: int, theta: float) -> None:
+        """Set theta for one face and upload to GPU."""
+        if self.scene.poly_theta is None or self.renderer is None:
+            return
+        self.scene.poly_theta[face] = theta
+        self.renderer.update_poly_theta(self.scene.poly_theta)
+
+    def _poly_scale_set(self, face: int, scale: float) -> None:
+        """Set scale for one face and upload to GPU."""
+        if self.scene.poly_scale is None or self.renderer is None:
+            return
+        self.scene.poly_scale[face] = max(0.01, scale)
+        self.renderer.update_poly_scale(self.scene.poly_scale)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Poly helpers: bake / save / load
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _bake_poly_to_layer(self) -> None:
+        """Rasterise per-face theta into the active flow-map layer texture."""
+        mesh      = self.scene.mesh
+        layer     = self.scene.active_layer
+        poly_theta = self.scene.poly_theta
+        if mesh is None or layer is None or poly_theta is None:
+            self._status = "Bake: nothing to do (load mesh and layer first)."
+            return
+
+        H, W   = layer.height, layer.width
+        tex    = layer.texture          # (H, W, 2) float32
+        idxs   = mesh.indices           # (F, 3)
+        uvs    = mesh.uvs               # (N, 2)
+
+        painted = 0
+        for fi in range(mesh.face_count):
+            theta = float(poly_theta[fi])
+            r_val = float(np.cos(2.0 * theta))
+            g_val = float(np.sin(2.0 * theta))
+
+            # Triangle vertices in texture-pixel space
+            p = np.stack([uvs[idxs[fi, k]] for k in range(3)])  # (3, 2)
+            px = p[:, 0] * W
+            py = p[:, 1] * H
+
+            x_min = max(0, int(np.floor(px.min())))
+            x_max = min(W - 1, int(np.ceil(px.max())))
+            y_min = max(0, int(np.floor(py.min())))
+            y_max = min(H - 1, int(np.ceil(py.max())))
+            if x_min > x_max or y_min > y_max:
+                continue
+
+            xs = np.arange(x_min, x_max + 1)
+            ys = np.arange(y_min, y_max + 1)
+            xx, yy = np.meshgrid(xs, ys)
+            cx = xx + 0.5
+            cy = yy + 0.5
+
+            # Barycentric test
+            denom = ((py[1]-py[2])*(px[0]-px[2]) + (px[2]-px[1])*(py[0]-py[2]))
+            if abs(denom) < 1e-12:
+                continue
+            a = ((py[1]-py[2])*(cx-px[2]) + (px[2]-px[1])*(cy-py[2])) / denom
+            b = ((py[2]-py[0])*(cx-px[2]) + (px[0]-px[2])*(cy-py[2])) / denom
+            mask = (a >= 0) & (b >= 0) & (a + b <= 1.0)
+
+            tex[yy[mask], xx[mask], 0] = r_val
+            tex[yy[mask], xx[mask], 1] = g_val
+            painted += mask.sum()
+
+        layer.dirty = True
+        if self.renderer is not None:
+            self.renderer.upload_dirty_region(layer, 0, 0, W, H)
+            self.renderer.update_ticks(mesh, layer)
+        self._status = f"Bake: wrote {painted} texels from {mesh.face_count} faces."
+
+    def _save_poly(self) -> None:
+        from tkinter import filedialog
+        if self.scene.poly_theta is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save poly data",
+            filetypes=[("NumPy archive", "*.npz")],
+            defaultextension=".npz",
+        )
+        if not path:
+            return
+        np.savez(
+            path,
+            poly_theta=self.scene.poly_theta,
+            poly_scale=self.scene.poly_scale
+            if self.scene.poly_scale is not None
+            else np.ones(len(self.scene.poly_theta), dtype=np.float32),
+        )
+        self._status = f"Poly data saved to {path}"
+
+    def _load_poly(self) -> None:
+        from tkinter import filedialog
+        if self.scene.mesh is None:
+            return
+        path = filedialog.askopenfilename(
+            title="Load poly data",
+            filetypes=[("NumPy archive", "*.npz")],
+        )
+        if not path:
+            return
+        try:
+            data = np.load(path)
+        except Exception as e:
+            self._status = f"Load poly failed: {e}"
+            return
+        F = self.scene.mesh.face_count
+        if "poly_theta" in data and len(data["poly_theta"]) == F:
+            self.scene.poly_theta = data["poly_theta"].astype(np.float32)
+            if self.renderer:
+                self.renderer.update_poly_theta(self.scene.poly_theta)
+        if "poly_scale" in data and len(data["poly_scale"]) == F:
+            self.scene.poly_scale = data["poly_scale"].astype(np.float32)
+            if self.renderer:
+                self.renderer.update_poly_scale(self.scene.poly_scale)
+        self._status = f"Poly data loaded from {path}"
+
     def _switch_tool(self, tool: str) -> None:
         if self._tool == "Spline" and self.spline_painter is not None:
             self.spline_painter.cancel()
             if self.renderer is not None:
                 self.renderer.clear_spline_preview()
+        if tool != "Poly":
+            self._selected_face  = -1
+            self._poly_drag_face = -1
         self._tool = tool
 
     def _spline_commit(self) -> None:
@@ -452,7 +674,11 @@ class App:
             self._status = f"Load failed: {e}"
             return
 
-        self.scene.mesh = mesh
+        self.scene.mesh       = mesh
+        self.scene.poly_theta = np.zeros(mesh.face_count, dtype=np.float32)
+        self.scene.poly_scale = np.ones(mesh.face_count,  dtype=np.float32)
+        self._selected_face   = -1
+        self._poly_drag_face  = -1
         self.camera.fit_to_mesh(mesh.vertices)
 
         # Create a default layer at the current resolution

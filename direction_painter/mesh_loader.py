@@ -81,7 +81,7 @@ def load_gltf(path: str) -> Mesh:
     face_bitan = bitangents[indices].mean(axis=1).astype(np.float32)
     face_bitan /= np.maximum(np.linalg.norm(face_bitan, axis=1, keepdims=True), 1e-8)
 
-    uv_aspect = _compute_uv_aspect(vertices, uvs, indices)
+    uv_aspect, uv_tan_len, face_uv_aspect, face_uv_tan_len = _compute_uv_aspect(vertices, uvs, indices)
 
     return Mesh(
         vertices=vertices,
@@ -91,6 +91,9 @@ def load_gltf(path: str) -> Mesh:
         indices=indices,
         bitangents=bitangents,
         uv_aspect=uv_aspect,
+        uv_tan_len=uv_tan_len,
+        face_uv_aspect=face_uv_aspect,
+        face_uv_tan_len=face_uv_tan_len,
         face_uv_centroids=face_uv_centroids,
         face_pos_centroids=face_pos_centroids,
         face_tangents=face_tan,
@@ -329,5 +332,7 @@ def _compute_uv_aspect(
     avg_tan  = tan_len_accum  / np.maximum(count, 1.0)
     avg_btan = btan_len_accum / np.maximum(count, 1.0)
 
-    aspect = avg_tan / np.maximum(avg_btan, 1e-8)
-    return aspect.astype(np.float32)
+    aspect       = avg_tan / np.maximum(avg_btan, 1e-8)
+    face_aspect  = tl / np.maximum(bl, 1e-8)
+    return (aspect.astype(np.float32), avg_tan.astype(np.float32),
+            face_aspect.astype(np.float32), tl.astype(np.float32))

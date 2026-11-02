@@ -41,7 +41,7 @@ def fill_island(
     free_mask = island & ~painted_mask           # texels to be filled
 
     # Work in complex space: z = R + i*G = e^(iθ)
-    field = layer.texture.copy().astype(np.float64)   # (H, W, 2)
+    field = layer.texture.copy().astype(np.float64)   # (H, W, 3)
 
     scales = sorted({max(1, W // 16), max(1, W // 8),
                      max(1, W // 4),  max(1, W // 2), W})
@@ -77,9 +77,10 @@ def fill_island(
     final = zoom(prev_field, (H / prev_field.shape[0], W / prev_field.shape[1], 1.0),
                  order=1)
 
-    # Normalise to unit vectors
-    mag = np.linalg.norm(final, axis=2, keepdims=True)
-    final /= np.maximum(mag, 1e-8)
+    # Normalise only the direction channels (R, G) to unit vectors;
+    # the B channel (intensity) is not part of the direction vector.
+    mag = np.linalg.norm(final[..., :2], axis=2, keepdims=True)
+    final[..., :2] /= np.maximum(mag, 1e-8)
 
     # Write back only the free texels
     layer.texture[free_mask] = final[free_mask].astype(np.float32)

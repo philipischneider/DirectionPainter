@@ -174,18 +174,16 @@ class Painter:
         within = dist <= 1.0
         weight = self.brush.strength * (1.0 - dist) ** 2 * within   # smooth falloff
 
-        sub = layer.texture[y0:y1, x0:x1, :]                        # (h, w, 2)
-        # Texture stores (cos 2θ, sin 2θ) — doubled-angle representation.
-        # Blend in the doubled space so that orientations θ and θ+π are
-        # treated as identical (π-periodic orientation field).
-        existing_a2 = np.arctan2(sub[..., 1], sub[..., 0])          # (h, w) = 2θ
+        sub = layer.texture[y0:y1, x0:x1, :]                        # (h, w, 3)
+        # Texture stores (cos θ, sin θ) — standard 360° direction encoding.
+        existing_a2 = np.arctan2(sub[..., 1], sub[..., 0])          # (h, w) = θ
 
         if self.brush.mode == "Comb":
-            # _comb_angle averages (R,G) of the doubled-angle texture, so
-            # its arctan2 result is already a doubled angle — use directly.
+            # _comb_angle averages (R,G) then takes arctan2 — result is the
+            # mean direction angle, use directly.
             new_a2 = self._comb_angle(layer, y0, y1, x0, x1)
         else:
-            new_a2 = np.full_like(existing_a2, 2.0 * angle)
+            new_a2 = np.full_like(existing_a2, angle)
 
         blended_a2 = _angle_slerp_arr(existing_a2, new_a2, weight)
         layer.texture[y0:y1, x0:x1, 0] = np.cos(blended_a2)
